@@ -12,6 +12,11 @@ from vllm.model_executor.parallel_utils.parallel_state import (
     is_cupy_nccl_enabled_for_all_reduce,
 )
 from vllm.model_executor.parallel_utils.custom_all_reduce import custom_all_reduce
+from ixformer.contrib.torch.extension.ixformer_torch.distributed import (
+    create_ixformer_group_from_pg,
+)
+from ixformer.distributed import all_reduce
+_IXFORMER_TENSOR_MODEL_PARALLEL_GROUP = None
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
@@ -29,6 +34,9 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     # Bypass the function if we are using only 1 GPU.
     if get_tensor_model_parallel_world_size() == 1:
         return input_
+    global _IXFORMER_TENSOR_MODEL_PARALLEL_GROUP
+    if _IXFORMER_TENSOR_MODEL_PARALLEL_GROUP is None:
+        _IXFORMER_TENSOR_MODEL_PARALLEL_GROUP = create_ixformer_group_from_pg(get_tensor_model_parallel_group())
     out = custom_all_reduce(input_)
     if out is not None:
         return out
@@ -36,8 +44,10 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
         # TODO: support multiple parallel groups.
         cupy_utils.all_reduce(input_)
     else:
-        torch.distributed.all_reduce(input_,
-                                     group=get_tensor_model_parallel_group())
+        all_reduce(input_,group=_IXFORMER_TENSOR_MODEL_PARALLEL_GROUP,async_op=True)
+        # TODO use our all reduce..
+        # torch.distributed.all_reduce(input_,
+        #                              group=get_tensor_model_parallel_group())
     return input_
 
 

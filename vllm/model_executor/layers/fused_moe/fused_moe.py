@@ -187,6 +187,9 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
                             num_tokens_post_padded: torch.Tensor,
                             mul_routed_weight: bool, top_k: int,
                             config: Dict[str, Any]) -> None:
+    # use Kernel for better performance
+    ops.invoke_fused_moe_kernel(A,B,C,topk_weights,topk_ids,sorted_token_ids,expert_ids,num_tokens_post_padded,mul_routed_weight,top_k,config)
+    return 
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 

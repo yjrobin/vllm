@@ -1,7 +1,6 @@
 # coding=utf-8
 # Adapted from
-# https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/qwen2/modeling_qwen2.py
-# Copyright 2024 The Qwen team.
+# https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
 # Copyright 2023 The vLLM team.
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
@@ -21,17 +20,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only Qwen2 model compatible with HuggingFace weights."""
-from typing import List, Optional, Tuple
+"""Inference-only LLaMA model compatible with HuggingFace weights."""
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import Qwen2Config
 
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import PagedAttention
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.layernorm import (RMSNorm)
+
+
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                MergedColumnParallelLinear,
                                                QKVParallelLinear,
@@ -39,18 +39,20 @@ from vllm.model_executor.layers.linear import (LinearMethodBase,
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding, ParallelLMHead)
+    VocabParallelEmbedding, 
+    ParallelLMHead)
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_world_size)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.weight_utils import (default_weight_loader,
                                               hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
+from vllm.transformers_utils.configs import CPMDragonflyConfig
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
-class Qwen2MLP(nn.Module):
+class CPMMLP(nn.Module):
 
     def __init__(
         self,
@@ -80,17 +82,18 @@ class Qwen2MLP(nn.Module):
         return x
 
 
-class Qwen2Attention(nn.Module):
+class CPMAttention(nn.Module):
 
-    def __init__(self,
-                 hidden_size: int,
-                 num_heads: int,
-                 num_kv_heads: int,
-                 max_position: int = 4096 * 32,
-                 rope_theta: float = 10000,
-                 use_sliding_window: bool = False,
-                 linear_method: Optional[LinearMethodBase] = None,
-                 sliding_window: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        linear_method: Optional[LinearMethodBase] = None,
+    ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
@@ -112,14 +115,14 @@ class Qwen2Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
-        self.sliding_window = sliding_window if use_sliding_window else None
+        self.max_position_embeddings = max_position_embeddings
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=True,
+            bias=False,
             linear_method=linear_method,
         )
         self.o_proj = RowParallelLinear(
@@ -132,14 +135,14 @@ class Qwen2Attention(nn.Module):
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=self.rope_theta,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
         )
         self.attn = PagedAttention(self.num_heads,
                                    self.head_dim,
                                    self.scaling,
-                                   num_kv_heads=self.num_kv_heads,
-                                   sliding_window=self.sliding_window)
+                                   num_kv_heads=self.num_kv_heads)
 
     def forward(
         self,
@@ -157,29 +160,29 @@ class Qwen2Attention(nn.Module):
         return output
 
 
-class Qwen2DecoderLayer(nn.Module):
+class CPMDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: Qwen2Config,
-        layer_idx: int,
+        config: CPMDragonflyConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Requires transformers > 4.32.0
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        use_sliding_window = config.use_sliding_window and layer_idx < config.max_window_layers
-        self.self_attn = Qwen2Attention(
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        max_position_embeddings = getattr(config, "max_position_embeddings",
+                                          8192)
+        self.self_attn = CPMAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            max_position=config.max_position_embeddings,
             num_kv_heads=config.num_key_value_heads,
             rope_theta=rope_theta,
-            use_sliding_window=use_sliding_window,
+            rope_scaling=rope_scaling,
+            max_position_embeddings=max_position_embeddings,
             linear_method=linear_method,
-            sliding_window=config.sliding_window)
-        self.mlp = Qwen2MLP(
+        )
+        self.mlp = CPMMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -189,6 +192,7 @@ class Qwen2DecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+        self.scale_states = config.scale_states # hidden_states
 
     def forward(
         self,
@@ -204,7 +208,7 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+                hidden_states, residual, scale = self.scale_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -214,32 +218,34 @@ class Qwen2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
+            hidden_states, residual, scale = self.scale_states)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
-class Qwen2Model(nn.Module):
+class CPMModel(nn.Module):
 
     def __init__(
         self,
-        config: Qwen2Config,
+        config: CPMDragonflyConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.config = config
-        self.padding_idx = config.pad_token_id
+        self.padding_idx = getattr(config,"pad_token_id",None)
         self.vocab_size = config.vocab_size
-
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
         )
         self.layers = nn.ModuleList([
-            Qwen2DecoderLayer(config, layer_idx, linear_method)
-            for layer_idx in range(config.num_hidden_layers)
+            CPMDecoderLayer(config, linear_method)
+            for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.scale = self.config.scale
+        self.scale_emb = self.config.scale_emb # embeding
+        self.scale_states = self.config.scale_states # hidden_states
 
     def forward(
         self,
@@ -248,7 +254,10 @@ class Qwen2Model(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if self.scale:
+            hidden_states = self.embed_tokens(input_ids) * self.scale_emb
+        else:
+            hidden_states = self.embed_tokens(input_ids)
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -259,24 +268,28 @@ class Qwen2Model(nn.Module):
                 input_metadata,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual, scale=self.scale_states)
         return hidden_states
 
 
-class Qwen2ForCausalLM(nn.Module):
+class CPMDragonflyForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen2Config,
+        config: CPMDragonflyConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.model = Qwen2Model(config, linear_method)
+        self.model = CPMModel(config, linear_method)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.sampler = Sampler(config.vocab_size)
-
+        
+        self.apply_inf = False
+        self.sampler_weight = None
+        self.scale_width = self.config.scale_width # output logits
+        
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -284,6 +297,7 @@ class Qwen2ForCausalLM(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
+        self.apply_inf = input_metadata.is_prompt
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    input_metadata)
         return hidden_states
@@ -292,9 +306,20 @@ class Qwen2ForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(self.lm_head.weight, hidden_states,
-                                   sampling_metadata)
+    ) -> SamplerOutput:
+        # next_tokens = self.sampler(self.sampler_weight,
+        #                            hidden_states,
+        #                            sampling_metadata,
+        #                            apply_inf = self.apply_inf,
+        #                            index=1,
+        #                            skip_prompt=True,  # skip prompt tokens when apply _apply_penalties function
+        #                            logits_scale=self.scale_width, # apply scale in sampler to avoid 
+        #                            )                              # an elementwise op on all outputs
+        next_tokens = self.sampler(self.sampler_weight,
+                                   hidden_states,
+                                   sampling_metadata,
+                                   logits_scale=self.scale_width,
+                                   )
         return next_tokens
 
     def load_weights(self,
@@ -315,6 +340,11 @@ class Qwen2ForCausalLM(nn.Module):
                 model_name_or_path, cache_dir, load_format, revision):
             if "rotary_emb.inv_freq" in name:
                 continue
+            if ("rotary_emb.cos_cached" in name
+                    or "rotary_emb.sin_cached" in name):
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                continue
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -330,11 +360,9 @@ class Qwen2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                try:
-                    param = params_dict[name]
-                except:
-                    assert name=="lm_head.weight" # for qwen1.5 0.5b,skip this
-                    continue
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+        self.sampler_weight = self.model.embed_tokens.weight if self.config.tie_lm_head == False else self.lm_head.weight

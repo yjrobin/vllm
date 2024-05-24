@@ -151,6 +151,10 @@ class AWQLinearMethod(LinearMethodBase):
         out_shape = (x.shape[:-1] + (qweight.shape[-1] * pack_factor, ))
         reshaped_x = x.reshape(-1, x.shape[-1])
 
+        out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros,
+                               pack_factor)
+        # TODO align
+        """
         # num_tokens >= threshold
         FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
 
@@ -160,6 +164,7 @@ class AWQLinearMethod(LinearMethodBase):
         else:
             out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros,
                                pack_factor)
+        """
         if bias is not None:
             out = out + bias
         return out.reshape(out_shape)

@@ -10,7 +10,7 @@ from vllm.model_executor.parallel_utils.parallel_state import (
 
 try:
     from vllm._C import custom_ar
-    import pynvml
+    # import pynvml avoid import error
 except ImportError:
     # For AMD GPUs
     custom_ar = None
@@ -146,6 +146,15 @@ class CustomAllreduce:
 
     # max_size: max supported allreduce size
     def __init__(self, rank, world_size, max_size=8192 * 1024) -> None:
+        self.max_size = max_size
+        self.world_size = world_size
+        self.full_nvlink = False
+        self._ptr = None
+        self.buffer = None
+        if not custom_ar.is_init():
+            custom_ar.init_cumtom_ar()
+        # TODO aling
+        """
         # buffers memory are owned by this Python class and passed to C++
         # meta data composes of two parts: meta data for synchronization
         # (256 bytes) and a temporary buffer for storing intermediate
@@ -173,7 +182,9 @@ class CustomAllreduce:
                                              self.full_nvlink)
         self.fast_cond = self.full_nvlink or world_size <= 2
         self.register_buffer(self.buffer)
-
+        """
+    #TODO align
+    """
     def _get_ipc_meta(self, inp: torch.Tensor):
         data = inp.untyped_storage()._share_cuda_()
         shard_data = (
@@ -202,6 +213,7 @@ class CustomAllreduce:
         handles, offsets = self._gather_ipc_meta((bytes(handle), offset))
         logger.info("Registering %d cuda graph addresses", len(offset))
         custom_ar.register_graph_buffers(self._ptr, handles, offsets)
+    """
 
     def should_custom_ar(self, inp: torch.Tensor):
         return custom_ar.should_custom_ar(inp, self.max_size, self.world_size,
@@ -223,9 +235,13 @@ class CustomAllreduce:
         return out
 
     def close(self):
+        custom_ar.dispose(self._ptr)
+        # TODO align
+        """
         if self._ptr:
             custom_ar.dispose(self._ptr)
             self._ptr = 0
+        """
 
     def __del__(self):
         self.close()

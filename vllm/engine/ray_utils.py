@@ -92,6 +92,21 @@ def initialize_cluster(
             raise ImportError(
                 "Ray is not installed. Please install Ray to use distributed "
                 "serving.")
+        import os
+        enable_head_ray = os.environ.get("ENABLE_HEAD_RAY",None)
+        if enable_head_ray is None:
+            if is_hip():
+                ray.init(address=ray_address,
+                        ignore_reinit_error=True,
+                        num_gpus=parallel_config.world_size)
+            else:
+                ray.init(address=ray_address, 
+                         ignore_reinit_error=True,
+                         num_gpus=parallel_config.world_size)
+        else:
+            ray.init()
+        # TODO align
+        """
         # Connect to a ray cluster.
         if is_hip():
             ray.init(address=ray_address,
@@ -99,6 +114,7 @@ def initialize_cluster(
                      num_gpus=parallel_config.world_size)
         else:
             ray.init(address=ray_address, ignore_reinit_error=True)
+        """
 
     if not parallel_config.worker_use_ray:
         assert parallel_config.world_size == 1, (

@@ -1,12 +1,14 @@
 """Multi-head attention."""
+import os
+enable_infer_paged_attn = os.getenv("ENABLE_INFER_PAGED_ATTN",None)
 from typing import List, Optional
 
 import importlib
 import torch
 import torch.nn as nn
-from xformers import ops as xops
-from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
-                                         LowerTriangularMaskWithTensorBias)
+from ixformer.contrib.xformers import ops as xops
+from ixformer.contrib.xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
+                                                          LowerTriangularMaskWithTensorBias)
 
 from vllm._C import ops
 from vllm._C import cache_ops
@@ -15,9 +17,12 @@ from vllm.model_executor.layers.triton_kernel.prefix_prefill import (
     context_attention_fwd)
 from vllm.utils import is_hip
 
-_SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
+# _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
+# # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
+# _PARTITION_SIZE = 512
+_SUPPORTED_HEAD_SIZES = [64, 128, 256]
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
-_PARTITION_SIZE = 512
+_PARTITION_SIZE = 256
 
 
 class PagedAttention(nn.Module):
@@ -60,6 +65,13 @@ class PagedAttention(nn.Module):
                              f"Supported head sizes: {_SUPPORTED_HEAD_SIZES}.")
 
         self.use_ref_attention = self.check_use_ref_attention()
+
+        # TODO align vllm do not need those
+        self.attn_op = xops.fmha.flash.FwOp()        
+        head_mapping = torch.repeat_interleave(
+            torch.arange(self.num_kv_heads, dtype=torch.int32),
+            self.num_queries_per_kv)
+        self.register_buffer("head_mapping", head_mapping, persistent=False)
 
     def check_use_ref_attention(self) -> bool:
         if not is_hip():
@@ -105,6 +117,125 @@ class PagedAttention(nn.Module):
         """PagedAttention forward pass.
 
         Args:
+            query: shape = [num_tokens, num_heads * head_size]
+            key: shape = [num_tokens, num_kv_heads * head_size]
+            value: shape = [num_tokens, num_kv_heads * head_size]
+            key_cache: shape = [num_blocks, num_kv_heads, head_size/x,
+                block_size, x]
+            value_cache: shape = [num_blocks, num_kv_heads, head_size,
+                block_size]
+            input_metadata: metadata for the inputs.
+            cache_event: event to wait for the cache operations to finish.
+        Returns:
+            shape = [batch_size, seq_len, num_heads * head_size]
+        """
+        num_tokens, hidden_size = query.shape
+        # Reshape the query, key, and value tensors.
+        query = query.view(-1, self.num_heads, self.head_size)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size)
+        slot_mapping = input_metadata.slot_mapping
+
+        # Reshape the keys and values and store them in the cache.
+        # If key_cache and value_cache are not provided, the new key and value
+        # vectors will not be cached. This happens during the initial memory
+        # profiling run.
+        if key_cache is not None and value_cache is not None:
+            cache_ops.reshape_and_cache(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+            )
+
+        if input_metadata.is_prompt:
+            # normal attention
+            if (key_cache is None or value_cache is None
+                    or input_metadata.block_tables.numel() == 0):
+                if input_metadata.attn_bias is None:
+                    if self.alibi_slopes is None:
+                        attn_bias = BlockDiagonalCausalMask.from_seqlens(input_metadata.prompt_lens)
+                        if self.sliding_window is not None:
+                            attn_bias = attn_bias.make_local_attention(
+                                self.sliding_window)
+                        input_metadata.attn_bias = attn_bias
+                    else:
+                        attn_bias = BlockDiagonalCausalMask.from_seqlens(input_metadata.prompt_lens)
+                        input_metadata.attn_bias = attn_bias
+                
+                if self.use_ref_attention:
+                    output = self.ref_masked_attention(
+                        query,
+                        key,
+                        value,
+                    )
+                    # Using view got RuntimeError: view size is not compatible with input tensor's size and stride
+                    # (at least one dimension spans across two contiguous subspaces). Use reshape instead
+                    return output.reshape(num_tokens, hidden_size)
+
+                # TODO(woosuk): Too many view operations. Let's try to reduce
+                # them in the future for code readability.
+                query = query.unsqueeze(0)
+                key = key.unsqueeze(0)
+                value = value.unsqueeze(0)
+
+                out = xops.memory_efficient_attention_forward(
+                    query,
+                    key,
+                    value,
+                    attn_bias=input_metadata.attn_bias,
+                    p=0.0,
+                    scale=self.scale,
+                    op=self.attn_op,
+                    alibi_slopes=self.alibi_slopes
+                )
+                output = out.view_as(query)  
+            else:
+                # prefix-enabled attention
+                output = torch.empty_like(query)
+                context_attention_fwd(
+                    query,
+                    key,
+                    value,
+                    output,
+                    key_cache,
+                    value_cache,
+                    input_metadata.block_tables,  # [BS, max_block_per_request]
+                    input_metadata.start_loc,
+                    input_metadata.prompt_lens,
+                    input_metadata.context_lens,
+                    input_metadata.max_seq_len,
+                    getattr(self, "alibi_slopes", None),
+                )
+        else:
+            # Decoding run.
+            output = _paged_attention(
+                query,
+                key_cache,
+                value_cache,
+                input_metadata,
+                self.head_mapping, # self.num_kv_heads
+                self.scale,
+                self.alibi_slopes,
+            )
+
+        # Reshape the output tensor.
+        return output.view(num_tokens, hidden_size)
+    # TODO align
+    """
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: Optional[torch.Tensor],
+        value_cache: Optional[torch.Tensor],
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+        PagedAttention forward pass.
+
+        Args:
             query: shape = [batch_size, seq_len, num_heads * head_size]
             key: shape = [batch_size, seq_len, num_kv_heads * head_size]
             value: shape = [batch_size, seq_len, num_kv_heads * head_size]
@@ -115,7 +246,7 @@ class PagedAttention(nn.Module):
             input_metadata: metadata for the inputs.
         Returns:
             shape = [batch_size, seq_len, num_heads * head_size]
-        """
+        
         batch_size, seq_len, hidden_size = query.shape
         # Reshape the query, key, and value tensors.
         query = query.view(-1, self.num_heads, self.head_size)
@@ -238,6 +369,7 @@ class PagedAttention(nn.Module):
 
         # Reshape the output tensor.
         return output.view(batch_size, seq_len, hidden_size)
+    """
 
 
 def _make_alibi_bias(
@@ -279,34 +411,23 @@ def _paged_attention(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     input_metadata: InputMetadata,
-    num_kv_heads: int,
+    head_mapping: torch.Tensor, # num_kv_heads: int,
     scale: float,
     alibi_slopes: Optional[torch.Tensor],
+    use_sqrt_alibi: bool = False
 ) -> torch.Tensor:
     output = torch.empty_like(query)
 
-    block_size = value_cache.shape[3]
-    num_seqs, num_heads, head_size = query.shape
-    max_num_partitions = (
-        (input_metadata.max_context_len + _PARTITION_SIZE - 1) //
-        _PARTITION_SIZE)
-    # NOTE(woosuk): We use a simple heuristic to decide whether to use
-    # PagedAttention V1 or V2. If the number of partitions is 1, we use
-    # V1 to avoid the overhead of reduction. Also, if the number of
-    # sequences or heads is large, we use V1 since there is enough work
-    # to parallelize.
-    # TODO(woosuk): Tune this heuristic.
-    # For context len > 8192, use V2 kernel to avoid shared memory shortage.
-    use_v1 = input_metadata.max_context_len <= 8192 and (
-        max_num_partitions == 1 or num_seqs * num_heads > 512)
-    if use_v1:
+    use_v2 = enable_infer_paged_attn is None and key_cache.dim() == 4
+    if not use_v2:
+        block_size = value_cache.shape[3]
         # Run PagedAttention V1.
         ops.paged_attention_v1(
             output,
             query,
             key_cache,
             value_cache,
-            num_kv_heads,
+            head_mapping, # num_kv_heads
             scale,
             input_metadata.block_tables,
             input_metadata.context_lens,
@@ -317,7 +438,11 @@ def _paged_attention(
         )
     else:
         # Run PagedAttention V2.
-        assert _PARTITION_SIZE % block_size == 0
+        block_size = value_cache.shape[2]
+        num_seqs, num_heads, head_size = query.shape
+        max_num_partitions = (
+            (input_metadata.max_context_len + _PARTITION_SIZE - 1) //
+            _PARTITION_SIZE)
         tmp_output = torch.empty(
             size=(num_seqs, num_heads, max_num_partitions, head_size),
             dtype=output.dtype,
@@ -337,7 +462,7 @@ def _paged_attention(
             query,
             key_cache,
             value_cache,
-            num_kv_heads,
+            head_mapping, # num_kv_heads
             scale,
             input_metadata.block_tables,
             input_metadata.context_lens,
@@ -347,3 +472,71 @@ def _paged_attention(
             input_metadata.kv_cache_dtype,
         )
     return output
+
+
+# ↓ add for smoothquant
+class DequantPagedAttention(PagedAttention):
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: Optional[int] = None,
+        alibi_slopes: Optional[List[float]] = None,
+        sliding_window: Optional[int] = None,
+        quant_kv_cache: bool = False,
+        kv_quant_params: torch.Tensor = None,
+        quant_scale: float = 1.0,
+        use_per_token_quant: bool = True,
+    ) -> None:
+        super().__init__(num_heads,
+                         head_size,
+                         scale,
+                         num_kv_heads,
+                         alibi_slopes,
+                         sliding_window)
+        self.register_parameter(
+            "quant_scale",
+            torch.nn.Parameter(
+                torch.tensor(quant_scale, dtype=torch.float32,requires_grad=False))
+           )
+        self.use_per_token_quant = use_per_token_quant
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        self.quant_scale.data = self.quant_scale.cpu()
+        return self
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.quant_scale.data = self.quant_scale.to(*args, **kwargs)
+        self.quant_scale.data = self.quant_scale.to(torch.float32)
+        return self
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: Optional[torch.Tensor],
+        value_cache: Optional[torch.Tensor],
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+        out = super().forward(
+            query,
+            key,
+            value,
+            key_cache,
+            value_cache,
+            input_metadata,
+        )
+        quant_out = torch.empty_like(out, dtype=torch.int8)
+        if self.use_per_token_quant:
+            scale = torch.empty(out.numel() // out.shape[-1],
+                                dtype=torch.float32,
+                                device=out.device)
+            ops.quant(quant_out, out, scale)
+            return quant_out, scale
+        else:
+            ops.quant(quant_out, out, self.quant_scale.item())
+            return (quant_out, )

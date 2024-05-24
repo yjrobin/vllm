@@ -5,12 +5,13 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.parallel_utils.communication_op import (
-    tensor_model_parallel_gather)
+    tensor_model_parallel_gather,tensor_model_parallel_all_gather)
 from vllm.model_executor.sampling_metadata import SamplingMetadata, SamplingTensors
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import (PromptLogprobs, SampleLogprobs, SamplerOutput,
                            SequenceData, SequenceGroupOutput, SequenceOutput)
 from vllm.utils import is_neuron
+import ixformer.functions as ixf_F
 
 
 class Sampler(nn.Module):
@@ -39,12 +40,24 @@ class Sampler(nn.Module):
         self.org_vocab_size = org_vocab_size or vocab_size
 
     def _get_logits(self, hidden_states: torch.Tensor, embedding: torch.Tensor,
-                    embedding_bias: Optional[torch.Tensor]) -> torch.Tensor:
+                    embedding_bias: Optional[torch.Tensor],
+                    logits_scale = None) -> torch.Tensor:
         # Get the logits for the next tokens.
+        if logits_scale is None:
+            logits = ixf_F.linear(hidden_states, embedding)
+        else:
+            logits = ixf_F.linear(hidden_states / logits_scale, embedding)
+        # TODO align
+        """
         logits = torch.matmul(hidden_states, embedding.t())
+        """
         if embedding_bias is not None:
             logits += embedding_bias
+        logits = tensor_model_parallel_all_gather(logits)
+        # TODO align
+        """
         logits = tensor_model_parallel_gather(logits)
+        """
         # Remove paddings in vocab (if any).
         if logits is not None:
             logits = logits[:, :self.org_vocab_size]
@@ -56,6 +69,7 @@ class Sampler(nn.Module):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
+        logits_scale = None,
     ) -> Optional[SamplerOutput]:
         # Get the hidden states that we use for sampling.
         if self.logits_as_hidden_states:
@@ -65,7 +79,7 @@ class Sampler(nn.Module):
                                                  sampling_metadata)
 
             # Get the logits for the next tokens.
-            logits = self._get_logits(hidden_states, embedding, embedding_bias)
+            logits = self._get_logits(hidden_states, embedding, embedding_bias, logits_scale)
 
         # Only perform sampling in the driver worker.
         # Note: `_get_logits` is still distributed across TP workers because

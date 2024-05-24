@@ -184,6 +184,21 @@ class _AsyncLLMEngine(LLMEngine):
         """
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
 
+        # Execute the model.
+        output = (await self._run_workers_async(
+            "execute_model",
+            seq_group_metadata_list=seq_group_metadata_list,
+            blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
+            blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
+            blocks_to_copy=scheduler_outputs.blocks_to_copy,
+        )) if not scheduler_outputs.is_empty() else []
+
+        return self._process_model_outputs(output, scheduler_outputs)
+
+        # TODO align
+        """
+        seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
+
         if not scheduler_outputs.is_empty():
             # Execute the model.
             all_outputs = await self._run_workers_async(
@@ -201,6 +216,7 @@ class _AsyncLLMEngine(LLMEngine):
             output = []
 
         return self._process_model_outputs(output, scheduler_outputs)
+        """
 
     async def encode_request_async(
         self,
@@ -252,11 +268,41 @@ class _AsyncLLMEngine(LLMEngine):
         self,
         method: str,
         *args,
+        get_all_outputs: bool = False,
+        **kwargs,
+    ) -> Any:
+        """Runs the given method on all workers."""
+        coros = []
+        for worker in self.workers:
+            if self.parallel_config.worker_use_ray:
+                coros.append(
+                    worker.execute_method.remote(method, *args, **kwargs))
+            else:
+                executor = getattr(worker, method)
+                coros.append(asyncio.get_event_loop().run_in_executor(
+                    None, partial(executor, *args, **kwargs)))
+
+        all_outputs = await asyncio.gather(*coros)
+
+        if get_all_outputs:
+            return all_outputs
+
+        # Make sure all workers have the same results.
+        output = all_outputs[0]
+        for other_output in all_outputs[1:]:
+            assert output == other_output
+        return output
+
+    # TODO align
+    """
+    async def _run_workers_async(
+        self,
+        method: str,
+        *args,
         driver_args: Optional[List[Any]] = None,
         driver_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Any:
-        """Runs the given method on all workers."""
         coros = []
 
         if driver_args is None:
@@ -275,6 +321,7 @@ class _AsyncLLMEngine(LLMEngine):
 
         all_outputs = await asyncio.gather(*coros)
         return all_outputs
+    """
 
 
 class AsyncLLMEngine:

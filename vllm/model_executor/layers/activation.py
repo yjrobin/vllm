@@ -160,3 +160,78 @@ def get_act_fn(
         return ScaledActivation(act_fn, intermediate_size, input_is_parallel,
                                 params_dtype)
     return act_fn
+
+
+# ↓ add for smoothquant
+class DequantSiluAndMulQuant(nn.Module):
+    """An activation function for SwiGLU.
+    The function computes x -> silu(x[:d]) * x[d:] where d = x.shape[1] // 2.
+    Shapes:
+        x: (num_tokens, 2 * d)
+        return: (num_tokens, d)
+    """
+
+    # TODO(Zhang Ying): use_per_token_quant
+    def __init__(self,
+                 gate_dequant_scale: float = 1.0,
+                 up_dequant_scale: float = 1.0,
+                 quant_scale: float = 1.0,
+                 use_per_token_quant: bool = True) -> None:
+        super().__init__()
+        self.register_parameter(
+            "gate_dequant_scale",
+            torch.nn.Parameter(
+                torch.tensor(gate_dequant_scale,dtype=torch.float32,requires_grad=False))
+        )
+        self.register_parameter(
+            "up_dequant_scale",
+            torch.nn.Parameter(
+                torch.tensor(up_dequant_scale,dtype=torch.float32,requires_grad=False))
+        )
+        self.register_parameter(
+            "quant_scale",
+            torch.nn.Parameter(
+                torch.tensor(quant_scale, dtype=torch.float32,requires_grad=False))
+        )
+        self.use_per_token_quant = use_per_token_quant
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        self.gate_dequant_scale.data = self.gate_dequant_scale.cpu()
+        self.up_dequant_scale.data = self.up_dequant_scale.cpu()
+        self.quant_scale.data = self.quant_scale.cpu()
+        return self
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.gate_dequant_scale.data = self.gate_dequant_scale.to(*args, **kwargs)
+        self.gate_dequant_scale.data = self.gate_dequant_scale.to(torch.float32)
+        self.up_dequant_scale.data = self.up_dequant_scale.to(*args, **kwargs)
+        self.up_dequant_scale.data = self.up_dequant_scale.to(torch.float32)
+        self.quant_scale.data = self.quant_scale.to(*args, **kwargs)
+        self.quant_scale.data = self.quant_scale.to(torch.float32)
+        return self
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        num_tokens = x.numel() // x.shape[-1]
+        d = x.shape[-1] // 2
+        out = torch.empty(*x.shape[:-1], d, dtype=torch.int8, device=x.device)
+        if self.use_per_token_quant:
+            scale = torch.empty(num_tokens,
+                                dtype=torch.float32,
+                                device=x.device)
+            # tmp is used in kernel func
+            tmp = torch.empty(num_tokens,
+                              d,
+                              dtype=torch.float32,
+                              device=x.device)
+            ops.dequant_silu_and_mul_quant(
+                out, x, self.gate_dequant_scale.item(), self.up_dequant_scale.item(),
+                scale, tmp)
+            return out, scale
+        else:
+            ops.dequant_silu_and_mul_quant(
+                out, x, self.gate_dequant_scale.item(), self.up_dequant_scale.item(),
+                self.quant_scale.item())
+            return out
+

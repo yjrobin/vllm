@@ -117,6 +117,7 @@ class GPTQLinearMethod(LinearMethodBase):
         if input_size != input_size_per_partition and self.quant_config.group_size != -1:
             # For act-order models, we cannot use Exllama for row parallel layer
             if self.quant_config.desc_act:
+                raise NotImplementedError()
                 exllama_state = ExllamaState.UNUSED
             else:
                 # we need to partition qzeros and scales for exllama kernel
@@ -199,7 +200,11 @@ class GPTQLinearMethod(LinearMethodBase):
                 weights["g_idx"] = torch.argsort(weights["g_idx"]).to(
                     torch.int)
             else:
+                weights["g_idx"] = None
+                # TODO align
+                """
                 weights["g_idx"] = torch.empty((1, 1), device="meta")
+                """
             weights["exllama_state"] = ExllamaState.READY
             ops.gptq_shuffle(weights["qweight"], weights["g_idx"],
                              self.quant_config.weight_bits)

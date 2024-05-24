@@ -91,7 +91,9 @@ class ModelConfig:
         self.code_revision = code_revision
         self.tokenizer_revision = tokenizer_revision
         self.quantization = quantization
-        self.enforce_eager = enforce_eager
+        self.enforce_eager = True 
+        # TODO align
+        # Use graph cause a runtime error, for now, do not use cuda graph
         self.max_context_len_to_capture = max_context_len_to_capture
 
         if os.environ.get("VLLM_USE_MODELSCOPE", "False").lower() == "true":
@@ -155,7 +157,7 @@ class ModelConfig:
         self.tokenizer_mode = tokenizer_mode
 
     def _verify_quantization(self) -> None:
-        supported_quantization = ["awq", "gptq", "squeezellm", "marlin"]
+        supported_quantization = ["awq", "gptq", "squeezellm", "marlin", "smoothquant"]
         rocm_not_supported_quantization = ["awq", "marlin"]
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
@@ -428,12 +430,22 @@ class ParallelConfig:
 
         # FIXME(woosuk): Fix the stability issues and re-enable the custom
         # all-reduce kernel.
+        
         if not self.disable_custom_all_reduce and self.world_size > 1:
-            self.disable_custom_all_reduce = True
-            logger.info(
-                "Custom all-reduce kernels are temporarily disabled due to "
-                "stability issues. We will re-enable them once the issues are "
-                "resolved.")
+            if self.world_size == 2:
+                self.disable_custom_all_reduce = True
+            else:
+                logger.info(
+                    "We provide an implementation of custom all reduce, if you only "
+                    "want to use NCCL, please add --disable-custom-all-reduce in CLI"
+                )
+        # TODO align
+        # if not self.disable_custom_all_reduce and self.world_size > 1:
+        #     self.disable_custom_all_reduce = True
+        #     logger.info(
+        #         "Custom all-reduce kernels are temporarily disabled due to "
+        #         "stability issues. We will re-enable them once the issues are "
+        #         "resolved.")
 
 
 class SchedulerConfig:
@@ -636,6 +648,7 @@ def _get_and_verify_max_len(
         # ChatGLM2
         "seq_length",
         # Others
+        "model_max_length",
         "max_sequence_length",
         "max_seq_length",
         "seq_len",

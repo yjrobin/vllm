@@ -371,7 +371,7 @@ class BaichuanForCausalLM(BaiChuanBaseForCausalLM):
     def __init__(self,
                  config,
                  linear_method: Optional[LinearMethodBase] = None):
-        if config.hidden_size == 4096:  # baichuan2 7b
+        if config.hidden_size in [4096,6656]:  # baichuan2 7b 33b
             super().__init__(config, "ROPE", linear_method)
         else:  # baichuan 13b, baichuan2 13b
             super().__init__(config, "ALIBI", linear_method)

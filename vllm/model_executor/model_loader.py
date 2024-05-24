@@ -46,7 +46,8 @@ def get_model(model_config: ModelConfig, device_config: DeviceConfig,
     linear_method = None
     if model_config.quantization is not None:
         quant_config = get_quant_config(model_config)
-        capability = torch.cuda.get_device_capability()
+        capability = (9, 0)
+        # capability = torch.cuda.get_device_capability() avoid capability error
         capability = capability[0] * 10 + capability[1]
         if capability < quant_config.get_min_capability():
             raise ValueError(
@@ -65,6 +66,53 @@ def get_model(model_config: ModelConfig, device_config: DeviceConfig,
     with _set_default_torch_dtype(model_config.dtype):
         # Create a model instance.
         # The weights will be initialized as empty tensors.
+        try:
+            # with torch.device contextmanager need torch >= 2.0
+            with torch.device(device_config.device):
+                if hasattr(model_class, "supported_lora_modules"):
+                    model = model_class(model_config.hf_config, linear_method,
+                                        lora_config)
+                elif lora_config:
+                    raise ValueError(
+                        f"Model {model_class.__name__} does not support LoRA, "
+                        "but LoRA is enabled. Support for this model may "
+                        "be added in the future. If this is important to you, "
+                        "please open an issue on github.")
+                else:
+                    model = model_class(model_config.hf_config, linear_method)
+            if model_config.load_format == "dummy":
+                # NOTE(woosuk): For accurate performance evaluation, we assign
+                # random values to the weights.
+                initialize_dummy_weights(model)
+            else:
+                # Load the weights from the cached or downloaded files.
+                model.load_weights(model_config.model, model_config.download_dir,
+                                model_config.load_format, model_config.revision)
+        # for torch < 2.0
+        except:
+            if hasattr(model_class, "supported_lora_modules"):
+                    model = model_class(model_config.hf_config, linear_method,
+                                        lora_config)
+            elif lora_config:
+                raise ValueError(
+                    f"Model {model_class.__name__} does not support LoRA, "
+                    "but LoRA is enabled. Support for this model may "
+                    "be added in the future. If this is important to you, "
+                    "please open an issue on github.")
+            else:
+                model = model_class(model_config.hf_config, linear_method)
+            model = model.cuda()
+            if model_config.load_format == "dummy":
+                # NOTE(woosuk): For accurate performance evaluation, we assign
+                # random values to the weights.
+                initialize_dummy_weights(model)
+            else:
+                # Load the weights from the cached or downloaded files.
+                model.load_weights(model_config.model, model_config.download_dir,
+                                model_config.load_format, model_config.revision)
+        return model.eval()
+        # TODO align
+        """
         with torch.device(device_config.device):
             if hasattr(model_class, "supported_lora_modules"):
                 model = model_class(model_config.hf_config, linear_method,
@@ -86,3 +134,4 @@ def get_model(model_config: ModelConfig, device_config: DeviceConfig,
             model.load_weights(model_config.model, model_config.download_dir,
                                model_config.load_format, model_config.revision)
     return model.eval()
+        """

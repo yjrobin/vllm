@@ -61,7 +61,17 @@ class Worker:
                                         device_config,
                                         lora_config=self.lora_config,
                                         kv_cache_dtype=kv_cache_dtype,
-                                        is_driver_worker=is_driver_worker)
+                                        is_driver_worker=False)
+        # TODO align
+        """
+        self.model_runner = ModelRunner(model_config,
+                                parallel_config,
+                                scheduler_config,
+                                device_config,
+                                lora_config=self.lora_config,
+                                kv_cache_dtype=kv_cache_dtype,
+                                is_driver_worker=is_driver_worker)
+        """
         # Uninitialized cache engine. Will be initialized by
         # self.init_cache_engine().
         self.cache_config = None
@@ -194,6 +204,43 @@ class Worker:
         blocks_to_swap_out: Optional[Dict[int, int]] = None,
         blocks_to_copy: Optional[Dict[int, List[int]]] = None,
     ) -> Optional[SamplerOutput]:
+        # Issue cache operations.
+        issued_cache_op = False
+        if blocks_to_swap_in:
+            self.cache_engine.swap_in(blocks_to_swap_in)
+            issued_cache_op = True
+        if blocks_to_swap_out:
+            self.cache_engine.swap_out(blocks_to_swap_out)
+            issued_cache_op = True
+        if blocks_to_copy:
+            self.cache_engine.copy(blocks_to_copy)
+            issued_cache_op = True
+
+        cache_events = self.cache_events if issued_cache_op else None
+
+        # Wait for cache operations to finish.
+        # TODO(woosuk): Profile swapping overhead and optimize if needed.
+        if cache_events is not None:
+            for event in cache_events:
+                event.wait()
+        # If there is no input, we don't need to execute the model.
+        if not seq_group_metadata_list:
+            return {}
+
+        output = self.model_runner.execute_model(seq_group_metadata_list,
+                                                 self.gpu_cache)
+        return output
+
+    # TODO align
+    """
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        seq_group_metadata_list: Optional[List[SequenceGroupMetadata]] = None,
+        blocks_to_swap_in: Optional[Dict[int, int]] = None,
+        blocks_to_swap_out: Optional[Dict[int, int]] = None,
+        blocks_to_copy: Optional[Dict[int, List[int]]] = None,
+    ) -> Optional[SamplerOutput]:
         if self.is_driver_worker:
             assert seq_group_metadata_list is not None
             num_seq_groups = len(seq_group_metadata_list)
@@ -223,6 +270,7 @@ class Worker:
         output = self.model_runner.execute_model(seq_group_metadata_list,
                                                  self.gpu_cache)
         return output
+    """
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
@@ -294,6 +342,7 @@ def init_distributed_environment(
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
     # Check if the GPU supports the dtype.
     if torch_dtype == torch.bfloat16:
+        return # avoid capability error
         compute_capability = torch.cuda.get_device_capability()
         if compute_capability[0] < 8:
             gpu_name = torch.cuda.get_device_name()

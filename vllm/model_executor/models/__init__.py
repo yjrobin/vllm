@@ -28,6 +28,9 @@ _MODELS = {
     "InternLMForCausalLM": ("llama", "LlamaForCausalLM"),
     "InternLM2ForCausalLM": ("internlm2", "InternLM2ForCausalLM"),
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
+    "SQLlamaForCausalLM": ("llama_smooth","LlamaForCausalLM"),
+    "CPMDragonflyForCausalLM": ("cpm", "CPMDragonflyForCausalLM"),
+    
     # For decapoda-research/llama-*
     "LLaMAForCausalLM": ("llama", "LlamaForCausalLM"),
     "MistralForCausalLM": ("llama", "LlamaForCausalLM"),

@@ -123,7 +123,9 @@ class MixtralMoE(nn.Module):
             param_data[expert_id, :, :] = loaded_weight[:, shard]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, sequence_length, hidden_size = hidden_states.shape
+        batch_size, hidden_size = hidden_states.shape
+        # TODO align
+        # batch_size, sequence_length, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits, _ = self.gate(hidden_states)
@@ -139,8 +141,10 @@ class MixtralMoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
 
-        return final_hidden_states.view(batch_size, sequence_length,
-                                        hidden_size)
+        return final_hidden_states.view(batch_size,hidden_size)
+        # TODO align
+        # return final_hidden_states.view(batch_size, sequence_length,
+        #                                 hidden_size)
 
 
 class MixtralAttention(nn.Module):

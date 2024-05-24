@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
+import ixformer.functions as F
 from torch.nn.parameter import Parameter
 
 from vllm.model_executor.parallel_utils.parallel_state import (
@@ -567,6 +567,179 @@ class RowParallelLinear(torch.nn.Module):
         # Matrix multiply.
         output_parallel = self.linear_method.apply_weights(
             self.linear_weights, input_parallel)
+        if self.reduce_results and self.tp_size > 1:
+            output_ = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output_ = output_parallel
+
+        if not self.skip_bias_add:
+            output = output_ + self.bias if self.bias is not None else output_
+            output_bias = None
+        else:
+            output = output_
+            output_bias = self.bias
+        return output, output_bias
+
+
+# ↓ add for smoothquant
+class QuantMergedColumnParallelLinear(MergedColumnParallelLinear):
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: List[int],
+        bias: bool = True,
+        gather_output: bool = False,
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        linear_method: Optional[LinearMethodBase] = None,
+        dequant_scale: float = 1.0,
+    ):
+        super().__init__(input_size,output_sizes,bias,gather_output,
+                         skip_bias_add,params_dtype,linear_method)
+        self.register_parameter("dequant_scale",
+            torch.nn.Parameter(
+                torch.tensor(dequant_scale,dtype=torch.float32,requires_grad=False))
+        )
+    
+    def _apply(self, fn):
+        super()._apply(fn)
+        self.dequant_scale.data = self.dequant_scale.cpu()
+        return self
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.dequant_scale.data = self.dequant_scale.to(*args, **kwargs)
+        self.dequant_scale.data = self.dequant_scale.to(torch.float32)
+        return self
+    
+    def forward(self, input_):
+        bias = self.bias if not self.skip_bias_add else None
+
+        # Matrix multiply.
+        output_parallel = self.linear_method.apply_weights(
+            self.linear_weights, input_, bias, scale=None, dequant_scale=1.0)
+        if self.gather_output:
+            # All-gather across the partitions.
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+
+class QuantQKVParallelLinear(QKVParallelLinear):
+    
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: Optional[int] = None,
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        linear_method: Optional[LinearMethodBase] = None,
+        q_dequant_scale: float = 1.0,
+        k_dequant_scale: float = 1.0,
+        v_dequant_scale: float = 1.0,
+    ):
+        super().__init__(hidden_size,head_size,total_num_heads,total_num_kv_heads,
+                        bias,skip_bias_add,params_dtype,linear_method)
+        self.register_parameter(
+            "q_dequant_scale",
+            torch.nn.Parameter(
+                torch.tensor(q_dequant_scale,dtype=torch.float32,requires_grad=False))
+        )
+        self.register_parameter(
+            "k_dequant_scale",
+            torch.nn.Parameter(
+                torch.tensor(k_dequant_scale,dtype=torch.float32,requires_grad=False))
+        )
+        self.register_parameter(
+            "v_dequant_scale",
+            torch.nn.Parameter(
+                torch.tensor(v_dequant_scale,dtype=torch.float32,requires_grad=False))
+        )
+    
+    def _apply(self, fn):
+        super()._apply(fn)
+        self.q_dequant_scale.data = self.q_dequant_scale.cpu()
+        self.k_dequant_scale.data = self.k_dequant_scale.cpu()
+        self.v_dequant_scale.data = self.v_dequant_scale.cpu()
+        return self
+    
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.q_dequant_scale.data = self.q_dequant_scale.to(*args, **kwargs)
+        self.q_dequant_scale.data = self.q_dequant_scale.to(torch.float32)
+        self.k_dequant_scale.data = self.k_dequant_scale.to(*args, **kwargs)
+        self.k_dequant_scale.data = self.k_dequant_scale.to(torch.float32)
+        self.v_dequant_scale.data = self.v_dequant_scale.to(*args, **kwargs)
+        self.v_dequant_scale.data = self.v_dequant_scale.to(torch.float32)
+        return self
+    
+    def forward(self, input_):
+        bias = self.bias if not self.skip_bias_add else None
+
+        # Matrix multiply.
+        output_parallel = self.linear_method.apply_weights(
+            self.linear_weights, input_, bias, scale=None, dequant_scale=1.0)
+        if self.gather_output:
+            # All-gather across the partitions.
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+
+class QuantRowParallelLinear(RowParallelLinear):
+    
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = True,
+        input_is_parallel: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        reduce_results: bool = True,
+        linear_method: Optional[LinearMethodBase] = None,
+        dequant_scale: float = 1.0,
+    ):
+        super().__init__(input_size,output_size,bias,input_is_parallel,
+                       skip_bias_add,params_dtype,reduce_results,linear_method)
+        self.register_parameter(
+            "dequant_scale",
+            torch.nn.Parameter(
+                torch.tensor(dequant_scale,dtype=torch.float32,requires_grad=False))
+        )
+    
+    def _apply(self, fn):
+        super()._apply(fn)
+        self.dequant_scale.data = self.dequant_scale.cpu()
+        return self
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.dequant_scale.data = self.dequant_scale.to(*args, **kwargs)
+        self.dequant_scale.data = self.dequant_scale.to(torch.float32)
+        return self
+    
+    def forward(self, input_, scale=None):
+        # Set up backprop all-reduce.
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            tp_rank = get_tensor_model_parallel_rank()
+            splitted_input = split_tensor_along_last_dim(
+                input_, num_partitions=self.tp_size)
+            input_parallel = splitted_input[tp_rank].contiguous()
+
+        # Matrix multiply.
+        output_parallel = self.linear_method.apply_weights(
+            self.linear_weights, input_parallel, self.bias, scale=scale, dequant_scale=self.dequant_scale.item(),is_row=True)
         if self.reduce_results and self.tp_size > 1:
             output_ = tensor_model_parallel_all_reduce(output_parallel)
         else:

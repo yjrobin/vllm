@@ -1,3 +1,5 @@
+import os
+enable_infer_paged_attn = os.getenv("ENABLE_INFER_PAGED_ATTN",None)
 """CacheEngine class for managing the KV cache."""
 from typing import Dict, List, Tuple
 
@@ -60,6 +62,41 @@ class CacheEngine:
     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
         element_size = torch.tensor([], dtype=self.dtype).element_size()
         x = 16 // element_size
+        use_v2 = self.head_size == 128 and self.block_size == 16 and enable_infer_paged_attn is None
+        if use_v2:
+            return (
+                self.num_heads,
+                self.block_size,
+                self.head_size,
+            )
+        else:
+            return (
+                self.num_heads,
+                self.head_size // x,
+                self.block_size,
+                x,
+            )
+
+    def get_value_block_shape(self) -> Tuple[int, int, int]:
+        use_v2 = self.head_size == 128 and self.block_size == 16 and enable_infer_paged_attn is None 
+        if use_v2:
+            return (
+                self.num_heads,
+                self.block_size,
+                self.head_size,
+            )
+        else:
+            return (
+                self.num_heads,
+                self.head_size,
+                self.block_size,
+            )
+
+    # TODO align
+    """
+    def get_key_block_shape(self) -> Tuple[int, int, int, int]:
+        element_size = torch.tensor([], dtype=self.dtype).element_size()
+        x = 16 // element_size
         return (
             self.num_heads,
             self.head_size // x,
@@ -73,18 +110,18 @@ class CacheEngine:
             self.head_size,
             self.block_size,
         )
-
+    """
     def allocate_gpu_cache(self) -> List[KVCache]:
         gpu_cache: List[KVCache] = []
         key_block_shape = self.get_key_block_shape()
         value_block_shape = self.get_value_block_shape()
         for _ in range(self.num_layers):
-            key_blocks = torch.empty(
+            key_blocks = torch.zeros(
                 size=(self.num_gpu_blocks, *key_block_shape),
                 dtype=self.dtype,
                 device="cuda",
             )
-            value_blocks = torch.empty(
+            value_blocks = torch.zeros(
                 size=(self.num_gpu_blocks, *value_block_shape),
                 dtype=self.dtype,
                 device="cuda",
@@ -103,13 +140,13 @@ class CacheEngine:
             logger.warning("Using 'pin_memory=False' as WSL is detected. "
                            "This may slow down the performance.")
         for _ in range(self.num_layers):
-            key_blocks = torch.empty(
+            key_blocks = torch.zeros(
                 size=(self.num_cpu_blocks, *key_block_shape),
                 dtype=self.dtype,
                 pin_memory=pin_memory,
                 device="cpu",
             )
-            value_blocks = torch.empty(
+            value_blocks = torch.zeros(
                 size=(self.num_cpu_blocks, *value_block_shape),
                 dtype=self.dtype,
                 pin_memory=pin_memory,

@@ -1,5 +1,6 @@
 import copy
 from collections import defaultdict
+from functools import partial
 import os
 import time
 import pickle
@@ -165,7 +166,7 @@ class LLMEngine:
         self.workers: List[Worker] = []
         distributed_init_method = get_distributed_init_method(
             get_ip(), get_open_port())
-        self.driver_worker = Worker(
+        worker = Worker(
             self.model_config,
             self.parallel_config,
             self.scheduler_config,
@@ -177,8 +178,23 @@ class LLMEngine:
             kv_cache_dtype=self.cache_config.cache_dtype,
             is_driver_worker=True,
         )
+        self.workers.append(worker)
+        
+        self._run_workers(
+            "init_model",
+            get_all_outputs=True,
+        )
+        self._run_workers(
+            "load_model",
+            get_all_outputs=True,
+            max_concurrent_workers=self.parallel_config.
+            max_parallel_loading_workers,
+        )
+        # TODO align
+        """
         self._run_workers("init_model")
         self._run_workers("load_model")
+        """
 
     def _init_tokenizer(self, **tokenizer_init_kwargs):
         init_kwargs = dict(
@@ -223,6 +239,8 @@ class LLMEngine:
                 # If the worker is on the same node as the driver, we use it
                 # as the resource holder for the driver process.
                 self.driver_dummy_worker = worker
+                # TODO align
+                self.workers.append(worker)
             else:
                 self.workers.append(worker)
 
@@ -240,6 +258,13 @@ class LLMEngine:
         node_workers = defaultdict(list)
         node_gpus = defaultdict(list)
 
+        for i, (node_id, gpu_ids) in enumerate(worker_node_and_gpu_ids):
+            node_workers[node_id].append(i)
+            node_gpus[node_id].extend(gpu_ids)
+        for node_id, gpu_ids in node_gpus.items():
+            node_gpus[node_id] = sorted(gpu_ids)
+        # TODO align
+        """
         node_workers[driver_node_id].append(0)
         node_gpus[driver_node_id].extend(driver_gpu_ids)
         for i, (node_id, gpu_ids) in enumerate(worker_node_and_gpu_ids,
@@ -248,6 +273,7 @@ class LLMEngine:
             node_gpus[node_id].extend(gpu_ids)
         for node_id, gpu_ids in node_gpus.items():
             node_gpus[node_id] = sorted(gpu_ids)
+        """
 
         # Set CUDA_VISIBLE_DEVICES for the driver.
         set_cuda_visible_devices(node_gpus[driver_node_id])
@@ -267,6 +293,35 @@ class LLMEngine:
         scheduler_config = copy.deepcopy(self.scheduler_config)
         device_config = copy.deepcopy(self.device_config)
 
+        
+        for rank, (worker, (node_id,
+                            _)) in enumerate(zip(self.workers,
+                                                 worker_node_and_gpu_ids)):
+            local_rank = node_workers[node_id].index(rank)
+            worker.init_worker.remote(
+                lambda rank=rank, local_rank=local_rank: Worker(
+                    model_config,
+                    parallel_config,
+                    scheduler_config,
+                    device_config,
+                    local_rank,
+                    rank,
+                    distributed_init_method,
+                    lora_config=self.lora_config,
+                    kv_cache_dtype=self.cache_config.cache_dtype,
+                ))
+        self._run_workers(
+            "init_model",
+            get_all_outputs=True,
+        )
+        self._run_workers(
+            "load_model",
+            get_all_outputs=True,
+            max_concurrent_workers=self.parallel_config.
+            max_parallel_loading_workers,
+        )
+        # TODO align
+        """
         for rank, (worker, (node_id,
                             _)) in enumerate(zip(self.workers,
                                                  worker_node_and_gpu_ids),
@@ -284,7 +339,6 @@ class LLMEngine:
                     lora_config=self.lora_config,
                     kv_cache_dtype=self.cache_config.cache_dtype,
                 ))
-
         driver_rank = 0
         driver_local_rank = node_workers[driver_node_id].index(driver_rank)
         self.driver_worker = Worker(
@@ -299,7 +353,6 @@ class LLMEngine:
             kv_cache_dtype=self.cache_config.cache_dtype,
             is_driver_worker=True,
         )
-
         # don't use cupy for eager mode
         self._run_workers("init_model",
                           cupy_port=get_open_port()
@@ -309,6 +362,7 @@ class LLMEngine:
             max_concurrent_workers=self.parallel_config.
             max_parallel_loading_workers,
         )
+        """
 
     def _verify_args(self) -> None:
         self.model_config.verify_with_parallel_config(self.parallel_config)
@@ -342,11 +396,22 @@ class LLMEngine:
         # Get the maximum number of blocks that can be allocated on GPU and CPU.
         num_blocks = self._run_workers(
             "profile_num_available_blocks",
+            get_all_outputs=True,
             block_size=self.cache_config.block_size,
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
             cpu_swap_space=self.cache_config.swap_space_bytes,
             cache_dtype=self.cache_config.cache_dtype,
         )
+        # TODO align
+        """
+        num_blocks = self._run_workers(
+            "profile_num_available_blocks",
+            block_size=self.cache_config.block_size,
+            gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
+            cpu_swap_space=self.cache_config.swap_space_bytes,
+            cache_dtype=self.cache_config.cache_dtype,
+        )
+        """
 
         # Since we use a shared centralized controller, we take the minimum
         # number of blocks across all workers to make sure all the memory
@@ -833,6 +898,17 @@ class LLMEngine:
         """
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
 
+        output = self._run_workers(
+            "execute_model",
+            seq_group_metadata_list=seq_group_metadata_list,
+            blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
+            blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
+            blocks_to_copy=scheduler_outputs.blocks_to_copy,
+        ) if not scheduler_outputs.is_empty() else []
+
+        return self._process_model_outputs(output, scheduler_outputs)
+        # TODO align
+        """
         if not scheduler_outputs.is_empty():
             # Execute the model.
             all_outputs = self._run_workers(
@@ -851,6 +927,7 @@ class LLMEngine:
             output = []
 
         return self._process_model_outputs(output, scheduler_outputs)
+        """
 
     def do_log_stats(self) -> None:
         """Forced log when no requests active."""
@@ -1005,6 +1082,59 @@ class LLMEngine:
     def list_loras(self) -> List[int]:
         return self._run_workers("list_loras")
 
+    def _run_workers_in_batch(
+        self,
+        workers,
+        method: str,
+        *args,
+        **kwargs,
+    ):
+        all_outputs = []
+        for worker in workers:
+            if self.parallel_config.worker_use_ray:
+                executor = partial(worker.execute_method.remote, method)
+            else:
+                executor = getattr(worker, method)
+
+            output = executor(*args, **kwargs)
+            all_outputs.append(output)
+        if self.parallel_config.worker_use_ray:
+            all_outputs = ray.get(all_outputs)
+        return all_outputs
+
+    def _run_workers(
+        self,
+        method: str,
+        *args,
+        get_all_outputs: bool = False,
+        max_concurrent_workers: Optional[int] = None,
+        **kwargs,
+    ) -> Any:
+        """Runs the given method on all workers."""
+        all_outputs = []
+        if max_concurrent_workers:
+            work_groups = [
+                self.workers[i:i + max_concurrent_workers]
+                for i in range(0, len(self.workers), max_concurrent_workers)
+            ]
+        else:
+            work_groups = [self.workers]
+
+        for workers in work_groups:
+            all_outputs.extend(
+                self._run_workers_in_batch(workers, method, *args, **kwargs))
+
+        if get_all_outputs:
+            return all_outputs
+
+        # Make sure all workers have the same results.
+        output = all_outputs[0]
+        for other_output in all_outputs[1:]:
+            assert output == other_output
+        return output
+
+    # TODO align
+    """
     def _run_workers(
         self,
         method: str,
@@ -1015,7 +1145,6 @@ class LLMEngine:
         use_ray_compiled_dag: bool = False,
         **kwargs,
     ) -> Any:
-        """Runs the given method on all workers."""
 
         if max_concurrent_workers:
             raise NotImplementedError(
@@ -1077,3 +1206,4 @@ class LLMEngine:
                 for worker in self.workers
             ])
         return forward_dag.experimental_compile()
+    """

@@ -359,17 +359,38 @@ class ChatGLMForCausalLM(nn.Module):
                      cache_dir: Optional[str] = None,
                      load_format: str = "auto",
                      revision: Optional[str] = None):
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path, cache_dir, load_format, revision):
-            if "rotary_pos_emb.inv_freq" in name:
-                continue
-            if "word_embeddings" in name:
-                name = name.replace(".word_embeddings", "")
-            # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader",
-                                    default_weight_loader)
-            weight_loader(param, loaded_weight)
+        try:
+            # torch < 2.0 do not have "remove_duplicate=False" in named_parameters
+            params_dict = dict(self.named_parameters(remove_duplicate=False))
+            for name, loaded_weight in hf_model_weights_iterator(
+                    model_name_or_path, cache_dir, load_format, revision):
+                if "rotary_pos_emb.inv_freq" in name:
+                    continue
+                if "word_embeddings" in name:
+                    name = name.replace(".word_embeddings", "")
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
+        except:
+            params_dict = dict(self.named_parameters())
+            for name, loaded_weight in hf_model_weights_iterator(
+                    model_name_or_path, cache_dir, load_format, revision):
+                if "rotary_pos_emb.inv_freq" in name:
+                    continue
+                if "word_embeddings" in name:
+                    name = name.replace(".word_embeddings", "")
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                try:
+                    param = params_dict[name]
+                except:
+                    assert name == "transformer.output_layer.weight"
+                    param = self.transformer.output_layer.weight
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)

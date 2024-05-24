@@ -49,7 +49,11 @@ class ModelRunner:
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
         self.lora_config = lora_config
+        self.is_driver_worker = False
+        # TODO align
+        """
         self.is_driver_worker = is_driver_worker
+        """
 
         # model_config can be None in tests/samplers/test_sampler.py.
         # FIXME(woosuk): This is a hack to make the tests work. Refactor this.
@@ -118,6 +122,137 @@ class ModelRunner:
         self.graph_block_tables = np.zeros(
             (max(_BATCH_SIZES_TO_CAPTURE), max_num_blocks), dtype=np.int32)
 
+    def _prepare_prompt(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+    ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, List[int], List[int],
+               List[int], List[int], Set[LoRARequest]]:
+        assert len(seq_group_metadata_list) > 0
+        input_tokens: List[int] = []
+        input_positions: List[int] = []
+        slot_mapping: List[List[int]] = []
+        lora_index_mapping: List[int] = []
+        lora_prompt_mapping: List[int] = []
+        lora_requests: Set[LoRARequest] = set()
+
+        prompt_lens: List[int] = []
+        context_lens: List[int] = []
+        subquery_lens: List[int] = []
+        prefix_block_tables: List[List[int]] = []
+        for seq_group_metadata in seq_group_metadata_list:
+            assert seq_group_metadata.is_prompt
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            assert len(seq_ids) == 1
+            seq_id = seq_ids[0]
+
+            seq_data = seq_group_metadata.seq_data[seq_id]
+            prompt_tokens = seq_data.get_token_ids()
+            prompt_len = len(prompt_tokens)
+            prompt_lens.append(prompt_len)
+            prefix_len = 0
+            prefix = seq_group_metadata.prefix
+            if prefix is not None and prefix.computed:
+                prefix_len = prefix.get_length()
+                prompt_tokens = prompt_tokens[prefix_len:]
+                prefix_block_tables.append(prefix.get_block_numbers())
+            else:
+                prefix_block_tables.append([])
+            # actual prompt lens
+            context_lens.append(prefix_len)
+            subquery_lens.append(prompt_len - prefix_len)
+
+            input_tokens.extend(prompt_tokens)
+            input_positions.extend(list(range(prefix_len, prefix_len + len(prompt_tokens))))
+
+            lora_id = seq_group_metadata.lora_int_id
+
+            if lora_id > 0:
+                lora_requests.add(seq_group_metadata.lora_request)
+
+            lora_index_mapping.append([lora_id] * (prompt_len - prefix_len))
+            lora_prompt_mapping.extend(
+                [lora_id] *
+                (prompt_len - prefix_len
+                 if seq_group_metadata.sampling_params.prompt_logprobs else 1))
+
+            if seq_group_metadata.block_tables is None:
+                # During memory profiling, the block tables are not initialized
+                # yet. In this case, we just use a dummy slot mapping.
+                slot_mapping.append([_PAD_SLOT_ID] * prompt_len)
+                continue
+
+            # Compute the slot mapping.
+            slot_mapping.append([])
+            block_table = seq_group_metadata.block_tables[seq_id]
+            # Mask the [0, start_idx) tokens of the prompt with _PAD_SLOT_ID,
+            # where start_idx is max(0, prompt_len - sliding_window).
+            # For example, if the prompt len is 10, sliding window is 8, and
+            # block size is 4, the first two tokens are masked and the slot
+            # mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
+            start_idx = 0
+            if self.sliding_window is not None:
+                assert prefix_len == 0, (
+                    "Prefix caching is currently not supported with "
+                    "sliding window attention")
+                start_idx = max(0, prompt_len - self.sliding_window)
+            for i in range(prompt_len):
+                if i < start_idx:
+                    slot_mapping[-1].append(_PAD_SLOT_ID)
+                    continue
+
+                block_number = block_table[i // self.block_size]
+                block_offset = i % self.block_size
+                slot = block_number * self.block_size + block_offset
+                slot_mapping[-1].append(slot)
+
+        max_prompt_len = max(subquery_lens)
+        slot_mappings = []
+        lora_index_mappints = []
+        for mapping in slot_mapping:
+            slot_mappings.extend(mapping)
+        for mapping in lora_index_mapping:
+            lora_index_mappints.extend(mapping)
+        
+        input_tokens = torch.tensor(input_tokens, dtype=torch.long, device=self.device)
+        input_positions = torch.tensor(input_positions, dtype=torch.long, device=self.device)
+        slot_mapping = torch.tensor(slot_mappings, dtype=torch.int, device=self.device)
+        
+        context_lens_tensor = torch.tensor(context_lens,
+                                           dtype=torch.int,
+                                           device=self.device)
+        # Prepare prefix block tables
+        max_prompt_block_table_len = max(len(t) for t in prefix_block_tables)
+        block_tables = _make_tensor_with_pad(
+            prefix_block_tables,
+            max_len=max_prompt_block_table_len,
+            pad=0,
+            dtype=torch.int,
+            device=self.device,
+        )
+
+        prompt_lens_tensor = torch.tensor(prompt_lens,
+                                          dtype=torch.int,
+                                          device=self.device)
+        start_loc_tensor = prompt_lens_tensor.cumsum(dim=-1)
+
+        input_metadata = InputMetadata(
+            prompt_lens=prompt_lens,
+            is_prompt=True,
+            slot_mapping=slot_mapping,
+            max_seq_len=max_prompt_len,
+            start_loc=start_loc_tensor,
+            max_context_len=None,
+            context_lens=context_lens_tensor,
+            block_tables=block_tables,
+            use_cuda_graph=False,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
+        return (input_tokens, input_positions, input_metadata, prompt_lens,
+                subquery_lens, lora_index_mapping, lora_prompt_mapping,
+                lora_requests)
+    
+    # TODO align
+    """
     def _prepare_prompt(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -260,7 +395,122 @@ class ModelRunner:
         return (input_tokens, input_positions, input_metadata, prompt_lens,
                 subquery_lens, lora_index_mapping, lora_prompt_mapping,
                 lora_requests)
+    """
 
+    def _prepare_decode(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+    ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata]:
+        assert len(seq_group_metadata_list) > 0
+        input_tokens: List[int] = []
+        input_positions: List[int] = []
+        slot_mapping: List[int] = []
+        context_lens: List[int] = []
+        block_tables: List[List[int]] = []
+        lora_index_mapping: List[int] = []
+        lora_prompt_mapping: List[int] = []
+        lora_requests: Set[LoRARequest] = set()
+
+        for seq_group_metadata in seq_group_metadata_list:
+            assert not seq_group_metadata.is_prompt
+
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            lora_id = seq_group_metadata.lora_int_id
+
+            if lora_id > 0:
+                lora_requests.add(seq_group_metadata.lora_request)
+
+            for seq_id in seq_ids:
+                seq_data = seq_group_metadata.seq_data[seq_id]
+                generation_token = seq_data.get_last_token_id()
+                input_tokens.extend([generation_token])
+
+                seq_len = seq_data.get_len()
+                position = seq_len - 1
+                input_positions.extend([position])
+
+                context_len = seq_len if self.sliding_window is None else min(
+                    seq_len, self.sliding_window)
+                context_lens.append(context_len)
+
+                block_table = seq_group_metadata.block_tables[seq_id]
+                block_number = block_table[position // self.block_size]
+                block_offset = position % self.block_size
+                slot = block_number * self.block_size + block_offset
+                slot_mapping.extend([slot])
+                lora_index_mapping.append([lora_id])
+                lora_prompt_mapping.append(lora_id)
+
+                if self.sliding_window is not None:
+                    sliding_window_blocks = (self.sliding_window //
+                                             self.block_size)
+                    block_table = block_table[-sliding_window_blocks:]
+                block_tables.append(block_table)
+        
+        batch_size = len(input_tokens)
+        max_context_len = max(context_lens)
+        
+        use_captured_graph = (
+            not self.model_config.enforce_eager
+            and batch_size <= _BATCH_SIZES_TO_CAPTURE[-1]
+            and max_context_len <= self.max_context_len_to_capture)
+
+        if use_captured_graph:
+            # Pad the input tokens, positions, and slot mapping to match the
+            # batch size of the captured graph.
+            graph_batch_size = _get_graph_batch_size(batch_size)
+            assert graph_batch_size >= batch_size
+            input_tokens.extend([0] * (graph_batch_size - batch_size))
+            input_positions.extend([0] * (graph_batch_size - batch_size))
+            slot_mapping.extend([_PAD_SLOT_ID] * (graph_batch_size - batch_size))
+            context_lens.extend([1] * (graph_batch_size - batch_size))
+            for _ in range(graph_batch_size - batch_size):
+                block_tables.append([])
+            batch_size = graph_batch_size
+
+        # When using CUDA graph, we don't need to make the tensors on the GPU
+        # because they will be eventually copied to the designated GPU buffer.
+        input_tokens = torch.tensor(input_tokens, dtype=torch.long, device=self.device)
+        input_positions = torch.tensor(input_positions, dtype=torch.long, device=self.device)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int, device=self.device)
+        context_lens = torch.tensor(context_lens,dtype=torch.int,device=self.device)
+
+        if use_captured_graph:
+            # The shape of graph_block_tables is
+            # [max batch size, max context len // block size].
+            input_block_tables = self.graph_block_tables[:batch_size]
+            for i, block_table in enumerate(block_tables):
+                if block_table:
+                    input_block_tables[i, :len(block_table)] = block_table
+            block_tables = torch.tensor(input_block_tables, device=self.device)
+        else:
+            max_block_table_len = max([len(t) for t in block_tables])
+            block_tables = _make_tensor_with_pad(block_tables,
+                                                 max_len=max_block_table_len,
+                                                 pad=0,
+                                                 dtype=torch.int,
+                                                 device=self.device)
+
+        lora_index_mapping = [
+            _pad_to_max(mapping, 1, pad=0) for mapping in lora_index_mapping
+        ]
+
+        input_metadata = InputMetadata(
+            prompt_lens=[],
+            is_prompt=False,
+            slot_mapping=slot_mapping,
+            max_seq_len=None,
+            start_loc=None,
+            max_context_len=max_context_len,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            use_cuda_graph=use_captured_graph,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
+        return input_tokens, input_positions, input_metadata, lora_index_mapping, lora_prompt_mapping, lora_requests
+
+    # TODO align
+    """
     def _prepare_decode(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -387,6 +637,7 @@ class ModelRunner:
         )
         return (input_tokens, input_positions, input_metadata,
                 lora_index_mapping, lora_prompt_mapping, lora_requests)
+    """
 
     def _prepare_sample(
         self,
@@ -427,8 +678,11 @@ class ModelRunner:
                               selected_token_start_idx + subquery_len - 1))
                 selected_token_indices.append(selected_token_start_idx +
                                               subquery_len - 1)
+                selected_token_start_idx += subquery_len
+                # TODO align
+                """
                 selected_token_start_idx += max_subquery_len
-
+                """
                 if sampling_params.seed is not None:
                     seq_group_metadata.state.generator = torch.Generator(
                         device="cuda").manual_seed(sampling_params.seed)
@@ -454,11 +708,22 @@ class ModelRunner:
                                             pin_memory=pin_memory)
         categorized_sample_indices = {
             t: _async_h2d(seq_ids,
+                          dtype=torch.long,
+                          target_device=self.device,
+                          pin_memory=pin_memory)
+            for t, seq_ids in categorized_sample_indices.items()
+        }
+        
+        # TODO align
+        """
+        categorized_sample_indices = {
+            t: _async_h2d(seq_ids,
                           dtype=torch.int,
                           target_device=self.device,
                           pin_memory=pin_memory)
             for t, seq_ids in categorized_sample_indices.items()
         }
+        """
 
         seq_data: Dict[int, SequenceData] = {}
         for seq_group_metadata in seq_group_metadata_list:
@@ -474,6 +739,8 @@ class ModelRunner:
         )
         return sampling_metadata
 
+    # TODO align
+    """
     def prepare_input_tensors(
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
@@ -585,6 +852,69 @@ class ModelRunner:
             kv_caches=kv_caches,
             input_metadata=input_metadata,
         )
+
+        # Sample the next token.
+        output = self.model.sample(
+            hidden_states=hidden_states,
+            sampling_metadata=sampling_metadata,
+        )
+        return output
+    """
+
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+        kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> SamplerOutput:
+        # NOTE: We assume that all sequences in the group are all prompts or
+        # all decodes.
+        is_prompt = seq_group_metadata_list[0].is_prompt
+        # Prepare input tensors.
+        if is_prompt:
+            (input_tokens, input_positions, input_metadata, prompt_lens,
+                subquery_lens, lora_index_mapping, lora_prompt_mapping,
+                lora_requests) = self._prepare_prompt(seq_group_metadata_list)
+        else:
+            (input_tokens, input_positions, input_metadata,
+                lora_index_mapping, lora_prompt_mapping,
+                lora_requests) = self._prepare_decode(seq_group_metadata_list)
+            prompt_lens = []
+            subquery_lens = None
+        sampling_metadata = self._prepare_sample(seq_group_metadata_list,
+                                                    prompt_lens,
+                                                    subquery_lens)
+
+        if self.lora_config:
+            flat_lora_index_mapping = [
+                item for sublist in lora_index_mapping for item in sublist
+            ]
+            lora_mapping = LoRAMapping(
+                flat_lora_index_mapping,
+                lora_prompt_mapping,
+            )
+        else:
+            lora_mapping = None
+
+        if self.lora_config:
+            self.set_active_loras(lora_requests, lora_mapping)
+        
+        # Execute the model.
+        if input_metadata.use_cuda_graph:
+            graph_batch_size = input_tokens.shape[0]
+            model_executable = self.graph_runners[graph_batch_size]
+        else:
+            model_executable = self.model
+        hidden_states = model_executable(
+            input_ids=input_tokens,
+            positions=input_positions,
+            kv_caches=kv_caches,
+            input_metadata=input_metadata,
+        )
+        
+        sampling_metadata = self._prepare_sample(seq_group_metadata_list,
+                                                     prompt_lens,
+                                                     subquery_lens)
 
         # Sample the next token.
         output = self.model.sample(
